@@ -201,7 +201,7 @@ interface ParamConfig {
 }
 
 export interface Config extends PromptConfig, ParamConfig {
-  type: 'token' | 'login' | 'naifu' | 'sd-webui' | 'stable-horde'
+  type: 'token' | 'login' | 'naifu' | 'sd-webui' | 'stable-horde' | 'comfyui'
   token?: string
   email?: string
   password?: string
@@ -230,6 +230,7 @@ export const Config = Schema.intersect([
       Schema.const('naifu').description('naifu'),
       Schema.const('sd-webui').description('sd-webui'),
       Schema.const('stable-horde').description('Stable Horde'),
+      Schema.const('comfyui').description('ComfyUI'),
     ]).default('token').description('登录方式。'),
   }).description('登录设置'),
 
@@ -278,6 +279,11 @@ export const Config = Schema.intersect([
       trustedWorkers: Schema.boolean().description('是否只请求可信任工作节点。').default(false),
       pollInterval: Schema.number().role('time').description('轮询进度间隔时长。').default(Time.second),
     }),
+    Schema.object({
+      type: Schema.const('comfyui'),
+      endpoint: Schema.string().description('API 服务器地址。').required(),
+      headers: Schema.dict(String).role('table').description('要附加的额外请求头。'),
+    }),
   ]),
 
   Schema.object({
@@ -321,6 +327,10 @@ export const Config = Schema.intersect([
     Schema.object({
       type: Schema.const('naifu').required(),
       sampler: sampler.createSchema(sampler.nai),
+    }),
+    Schema.object({
+      type: Schema.const('comfyui').required(),
+      sampler: Schema.string().description('默认的生成模型。'),
     }),
     Schema.intersect([
       Schema.object({

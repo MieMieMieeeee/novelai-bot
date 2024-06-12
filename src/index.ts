@@ -5,6 +5,7 @@ import { closestMultiple, download, forceDataPrefix, getImageSize, login, Networ
 import { } from '@koishijs/translator'
 import { } from '@koishijs/plugin-help'
 import AdmZip from 'adm-zip'
+import { log } from 'console'
 
 export * from './config'
 
@@ -301,6 +302,8 @@ export function apply(ctx: Context, config: Config) {
             return '/api/v2/generate/async'
           case 'naifu':
             return '/generate-stream'
+          case 'comfyui':
+            return '/prompt'
           default:
             return '/ai/generate-image'
         }
@@ -392,6 +395,101 @@ export function apply(ctx: Context, config: Config) {
               r2: true,
             }
           }
+          case 'comfyui': {
+            const prompt= {
+              "3": {
+                "inputs": {
+                  "seed": parameters.seed.toString(),
+                  "steps": 20,
+                  "cfg": 8,
+                  "sampler_name": "euler",
+                  "scheduler": "normal",
+                  "denoise": 0.8700000000000001,
+                  "model": [
+                    "14",
+                    0
+                  ],
+                  "positive": [
+                    "6",
+                    0
+                  ],
+                  "negative": [
+                    "7",
+                    0
+                  ],
+                  "latent_image": [
+                    "16",
+                    0
+                  ]
+                },
+                "class_type": "KSampler"
+              },
+              "6": {
+                "inputs": {
+                  "text": "hatsune_miku, ",
+                  "clip": [
+                    "14",
+                    1
+                  ]
+                },
+                "class_type": "CLIPTextEncode"
+              },
+              "7": {
+                "inputs": {
+                  "text": "lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry",
+                  "clip": [
+                    "14",
+                    1
+                  ]
+                },
+                "class_type": "CLIPTextEncode"
+              },
+              "8": {
+                "inputs": {
+                  "samples": [
+                    "3",
+                    0
+                  ],
+                  "vae": [
+                    "17",
+                    0
+                  ]
+                },
+                "class_type": "VAEDecode"
+              },
+              "9": {
+                "inputs": {
+                  "filename_prefix": "ComfyUI",
+                  "images": [
+                    "8",
+                    0
+                  ]
+                },
+                "class_type": "SaveImage"
+              },
+              "14": {
+                "inputs": {
+                  "ckpt_name": "anything-v4.5-pruned.safetensors"
+                },
+                "class_type": "CheckpointLoaderSimple"
+              },
+              "16": {
+                "inputs": {
+                  "width": 512,
+                  "height": 800,
+                  "batch_size": 1
+                },
+                "class_type": "EmptyLatentImage"
+              },
+              "17": {
+                "inputs": {
+                  "vae_name": "animevae.pt"
+                },
+                "class_type": "VAELoader"
+              }
+            }
+            return  prompt;
+          }
         }
       }
 
@@ -409,17 +507,88 @@ export function apply(ctx: Context, config: Config) {
       let finalPrompt = prompt
       const iterate = async () => {
         const request = async () => {
-          const res = await ctx.http(trimSlash(config.endpoint) + path, {
-            method: 'POST',
-            timeout: config.requestTimeout,
-            // Since novelai's latest interface returns an application/x-zip-compressed, a responseType must be passed in
-            responseType: config.type === 'naifu' ? 'text' : ['login', 'token'].includes(config.type) ? 'arraybuffer' : 'json',
-            headers: {
-              ...config.headers,
-              ...getHeaders(),
-            },
-            data: getPayload(),
-          })
+          logger.debug('data:', getPayload())
+          let res
+          if (config.type == 'comfyui') {
+            const clientId = session.id.toString();
+            const serverAddress = trimSlash(config.endpoint);
+            async function queuePrompt(prompt: any) {
+              const p = { "prompt": getPayload(), "client_id": clientId };
+              logger.debug('queuePrompt:', p)
+              const response = await ctx.http(`${serverAddress}/prompt`, 
+                  {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  data: JSON.stringify(p)
+                });
+              return await response.data;
+            }
+            async function getImage(filename: string, subfolder: string, folderType: string) {
+              const urlValues = new URLSearchParams({ filename, subfolder, type: folderType }).toString();
+              const response = await ctx.http(`${serverAddress}/view?${urlValues}`);
+              logger.debug('getImage response:', response)
+              return await response.data;
+            }
+            
+            async function getHistory(promptId: string) {
+                const response = await ctx.http(`${serverAddress}/history/${promptId}`);
+                logger.debug('getHistory response:', response)
+                return await response.data;
+            }
+            
+            async function getImages(ws: WebSocket, prompt: any) {
+                const { prompt_id } = await queuePrompt(prompt);
+                logger.debug('prompt_id:', prompt_id)
+                const outputImages: any = {};
+                return new Promise((resolve, reject) => {
+                    ws.addEventListener('message', async (event) => {
+                        // logger.debug('event:', event.data)
+                        const data = event.data;
+                        if (typeof data === 'string') {
+                            const message = JSON.parse(data);
+                            if (message['type'] === 'executing') {
+                                const { node, prompt_id: messagePromptId } = message['data'];
+                                if (node === null && messagePromptId === prompt_id) {
+                                    const history = await getHistory(prompt_id);
+                                    const outputs = history[prompt_id]['outputs'];
+                                    for (const nodeId in outputs) {
+                                        const nodeOutput = outputs[nodeId];
+                                        if ('images' in nodeOutput) {
+                                            const imagesOutput: Buffer[] = [];
+                                            for (const image of nodeOutput['images']) {
+                                                logger.debug('image:', image['filename'])
+                                                const imageData = await getImage(image['filename'], image['subfolder'], image['type']);
+                                                imagesOutput.push(imageData);
+                                            }
+                                            resolve(imagesOutput);
+                                        }
+                                    }
+                                    resolve(outputImages);
+                                }
+                            }
+                        }
+                    });
+                });
+            }
+            logger.debug('ws:', `${serverAddress.replace(/^http(s?):\/\//, 'ws://')}/ws?clientId=${clientId}`)
+            const ws = ctx.http.ws(`${serverAddress.replace(/^http(s?):\/\//, 'ws://')}/ws?clientId=${clientId}`);
+          
+            res= await getImages(ws, prompt)
+          } else {
+            res = await ctx.http(trimSlash(config.endpoint) + path, {
+              method: 'POST',
+              timeout: config.requestTimeout,
+              // Since novelai's latest interface returns an application/x-zip-compressed, a responseType must be passed in
+              responseType: config.type === 'naifu' ? 'text' : ['login', 'token'].includes(config.type) ? 'arraybuffer' : 'json',
+              headers: {
+                ...config.headers,
+                ...getHeaders(),
+              },
+              data: getPayload(),
+            })
+          }
+          
+          logger.debug('response:', res)
 
           if (config.type === 'sd-webui') {
             const data = res.data as StableDiffusionWebUI.Response
@@ -452,6 +621,9 @@ export function apply(ctx: Context, config: Config) {
             const imgRes = await ctx.http(imgUrl, { responseType: 'arraybuffer' })
             const b64 = Buffer.from(imgRes.data).toString('base64')
             return forceDataPrefix(b64, imgRes.headers.get('content-type'))
+          }
+          if (config.type === 'comfyui') {
+            return forceDataPrefix(Buffer.from(res[0]).toString('base64'))
           }
           // event: newImage
           // id: 1
